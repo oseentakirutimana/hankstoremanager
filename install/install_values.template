@@ -1,0 +1,6 @@
+# install/install_values.template
+# Template committed to repo. DO NOT put real secrets here.
+FACTURATION_OBR_FERNET_KEY=
+OBR_USERNAME=
+OBR_PASSWORD=
+OBR_SYSTEM_ID=

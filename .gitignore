@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+env/
+venv/
+.venv/
+
+# Build
+dist/
+build/
+
+# Ignore tous les .spec sauf ceux explicitement ajoutés
+*.spec
+!postinstall_writer.spec
+!hankstoremanager.spec
+
+# Installer artifacts
+# Ignorer les exécutables générés mais garder le dossier et le placeholder .gitkeep
+install/build_artifacts/*
+!install/build_artifacts/.gitkeep
+install/Output/
+# Ignorer exécutables et installateurs globaux (mais .gitkeep déjà autorisé ci‑dessus)
+*.exe
+*.msi
+
+# Secrets and env
+.env
+install/install_values.txt
+*.pem
+*.pfx
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/

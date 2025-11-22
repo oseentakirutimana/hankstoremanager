@@ -1,0 +1,24 @@
+{
+  "version": "0.2",
+  "language": "en",
+  "words": [
+    "Inno",
+    "Hankstore",
+    "HankstoreManager",
+    "MSYS2",
+    "msys",
+    "msystem",
+    "sqlcipher",
+    "libsqlcipher",
+    "pwsh",
+    "SQLCIPHER",
+    "pyinstaller",
+    "dotenv",
+    "FERNET",
+    "ISCC",
+    "choco",
+    "noconfirm",
+    "appico",
+    "postinstall_writer"
+  ]
+}

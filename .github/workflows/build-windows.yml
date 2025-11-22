@@ -1,0 +1,257 @@
+name: Build Windows Installer (PyInstaller + Inno Setup + SQLCipher)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+env:
+  APP_NAME: hankstoremanager
+  APP_VERSION: 0.01
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  build-windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python (actions/setup-python)
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Debug: python --version and where python
+        shell: pwsh
+        run: |
+          Write-Host "Python version and location:"
+          python --version
+          Get-Command python | Select-Object Source | Format-List
+
+      - name: Verify tkinter availability in build Python
+        shell: pwsh
+        run: |
+          try {
+            python - <<'PY'
+import importlib, sys
+try:
+    import tkinter
+    import tkinter.ttk
+    print("TKINTER_OK", getattr(tkinter, "TkVersion", "unknown"))
+except Exception as e:
+    print("TKINTER_IMPORT_ERROR:", e, file=sys.stderr)
+    raise
+PY
+          } catch {
+            Write-Warning "tkinter import failed in the current Python. Will attempt to install official CPython via Chocolatey."
+          }
+
+      - name: Install MSYS2 and mingw packages (sqlcipher)
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-pkg-config
+            mingw-w64-x86_64-sqlcipher
+          msystem: MINGW64
+          path-type: auto
+
+      - name: Ensure mingw64 bin on PATH
+        shell: pwsh
+        run: |
+          $mingw = "C:\msys64\mingw64\bin"
+          if (Test-Path $mingw) {
+            Write-Host "Adding $mingw to PATH"
+            "PATH=$mingw;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Host "mingw64 bin not found at $mingw; continuing"
+          }
+
+      - name: Locate SQLCipher DLL and export SQLCIPHER_DLL_PATH
+        shell: pwsh
+        run: |
+          $dllCandidates = @(
+            "C:\msys64\mingw64\bin\libsqlcipher-1.dll",
+            "C:\msys64\mingw64\bin\libsqlcipher.dll",
+            "$env:USERPROFILE\\miniconda3\\Library\\bin\\libsqlcipher-1.dll",
+            "$env:USERPROFILE\\miniconda3\\Library\\bin\\libsqlcipher.dll",
+            "C:\ProgramData\Miniconda3\Library\bin\libsqlcipher-1.dll",
+            "C:\ProgramData\Miniconda3\Library\bin\libsqlcipher.dll"
+          )
+          $found = $null
+          foreach ($p in $dllCandidates) {
+            if (Test-Path $p) { $found = (Resolve-Path $p).Path; break }
+          }
+          if (-not $found -and (Test-Path "C:\msys64\mingw64\bin")) {
+            $search = Get-ChildItem -Path "C:\msys64\mingw64\bin" -Filter "*sqlcipher*.dll" -ErrorAction SilentlyContinue
+            if ($search) { $found = $search[0].FullName }
+          }
+          if ($found) {
+            Write-Host "SQLCipher DLL found: $found"
+            "SQLCIPHER_DLL_PATH=$found" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          } else {
+            Write-Host "SQLCipher DLL not found automatically; PyInstaller may still collect DLL from wheels"
+          }
+
+      - name: Install Python build deps (pip)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pyinstaller cryptography python-dotenv
+          fi
+
+      - name: Verify spec files exist
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "./postinstall_writer.spec")) { Write-Error "postinstall_writer.spec missing at repo root"; exit 1 }
+          if (-not (Test-Path "./hankstoremanager.spec")) { Write-Error "hankstoremanager.spec missing at repo root"; exit 1 }
+          Write-Host "Spec files found."
+
+      - name: Create install/install_values.txt from secret (production)
+        shell: pwsh
+        env:
+          PROD_FERNET_KEY: ${{ secrets.PROD_FERNET_KEY }}
+        run: |
+          New-Item -ItemType Directory -Path install -Force | Out-Null
+          if ($env:PROD_FERNET_KEY) {
+            Write-Host "Creating install\install_values.txt from secret"
+            $content = "FACTURATION_OBR_FERNET_KEY=$($env:PROD_FERNET_KEY)`nOBR_USERNAME=`nOBR_PASSWORD=`nOBR_SYSTEM_ID=`n"
+            Set-Content -Path install\install_values.txt -Value $content -Encoding UTF8
+          } else {
+            Write-Host "PROD_FERNET_KEY not set; skipping creation of install_values.txt"
+          }
+
+      - name: Build postinstall_writer (PyInstaller)
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean postinstall_writer.spec --hidden-import=tkinter --hidden-import=tkinter.ttk
+
+      - name: Build application (PyInstaller)
+        shell: bash
+        run: |
+          pyinstaller --noconfirm --clean hankstoremanager.spec --hidden-import=tkinter --hidden-import=tkinter.ttk
+
+      - name: Prepare install/build_artifacts
+        shell: bash
+        run: |
+          mkdir -p install/build_artifacts
+          [ -f dist/postinstall_writer.exe ] && cp -v dist/postinstall_writer.exe install/build_artifacts/ || true
+          [ -f dist/hankstoremanager.exe ] && cp -v dist/hankstoremanager.exe install/build_artifacts/ || true
+          ls -la install/build_artifacts || true
+
+      - name: Post-build: list bundle contents (debug)
+        shell: pwsh
+        run: |
+          $distDir = "dist\hankstoremanager"
+          if (Test-Path $distDir) {
+            Write-Host "Listing dist folder:"
+            Get-ChildItem -Recurse $distDir | Select-Object FullName,Length | Format-Table -AutoSize
+          } else {
+            Write-Warning "dist\hankstoremanager not found; checking dist root"
+            Get-ChildItem -Recurse dist | Select-Object FullName,Length | Format-Table -AutoSize
+          }
+
+      - name: Verify Tcl/Tk present in bundle
+        shell: pwsh
+        run: |
+          $dist="dist\hankstoremanager"
+          $missing = $false
+          if (-not (Test-Path $dist)) { Write-Warning "$dist not found"; exit 0 }
+          if (-not (Test-Path "$dist\tcl")) {
+            Write-Warning "tcl folder missing in bundle ($dist\tcl)"
+            $missing = $true
+          }
+          $dlls = Get-ChildItem -Path $dist -Filter "tcl*.dll" -ErrorAction SilentlyContinue
+          if (-not $dlls) {
+            Write-Warning "No tcl/tk DLLs found next to exe in $dist"
+            $missing = $true
+          }
+          if ($missing) {
+            Write-Warning "Tcl/Tk appears missing from the bundle; the app may fail to import tkinter at runtime"
+          } else {
+            Write-Host "Tcl/Tk resources look present in bundle"
+          }
+
+      - name: Verify installer inputs
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "install/build_artifacts/hankstoremanager.exe")) { Write-Error "Missing: install/build_artifacts/hankstoremanager.exe"; exit 1 }
+          if (-not (Test-Path "install/build_artifacts/postinstall_writer.exe")) { Write-Error "Missing: install/build_artifacts/postinstall_writer.exe"; exit 1 }
+          if (-not (Test-Path "install/install_values.txt")) { Write-Warning "install_values.txt absent (OK en dev, attendu en prod si secret défini)" }
+          if (-not (Test-Path "src/assets/app.ico")) { Write-Warning "src/assets/app.ico absent (icônes des raccourcis dépendront de l'exe)" }
+          if (-not (Test-Path "src/assets/logo.jpg")) { Write-Warning "src/assets/logo.jpg absent (wizard image optionnelle)" }
+          Write-Host "Installer inputs verified."
+
+      - name: Install Inno Setup (Chocolatey)
+        shell: pwsh
+        run: |
+          choco install innosetup -y
+
+      - name: Install Visual C++ Redistributable (choco)
+        shell: pwsh
+        run: |
+          Write-Host "Installing Visual C++ Redistributable (VC++ 2015-2022) via Chocolatey"
+          choco install vcredist-all -y
+          Write-Host "vcredist-all exit code: $LASTEXITCODE"
+
+      - name: Install official CPython via choco (optional, enabled)
+        shell: pwsh
+        run: |
+          Write-Host "Installing CPython via Chocolatey to ensure Tcl/Tk presence"
+          choco install python --version=3.11.6 -y
+          # Ensure the new python is first on PATH for subsequent steps
+          $pyPath = (Get-Command python).Source
+          Write-Host "Python resolved to: $pyPath"
+          $pythonDir = Split-Path -Parent $pyPath
+          "PATH=$pythonDir;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Post-choco verify python and tkinter
+        shell: pwsh
+        run: |
+          Write-Host "Post-choco: python --version and import tkinter test"
+          python --version
+          try {
+            python - <<'PY'
+import sys
+try:
+    import tkinter
+    import tkinter.ttk
+    print("TKINTER_OK", getattr(tkinter, "TkVersion", "unknown"))
+except Exception as e:
+    print("TKINTER_IMPORT_ERROR:", e, file=sys.stderr)
+    raise
+PY
+          } catch {
+            Write-Warning "tkinter import failed even after installing CPython via choco. Check the runner image or consider installing Tcl/Tk manually."
+          }
+
+      - name: Compile Inno Setup Script (ISCC)
+        shell: pwsh
+        env:
+          SQLCIPHER_DLL_PATH: ${{ env.SQLCIPHER_DLL_PATH }}
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "ISCC.exe" }
+          if (-not (Test-Path $iscc)) {
+            Write-Error "ISCC.exe not found; ensure Inno Setup is installed"
+            exit 1
+          }
+          & $iscc "install\installer.iss" | Write-Host
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: HankstoreManager-Installer
+          path: |
+            install/Output/HankstoreManager_Setup_v0.01.exe
+            install/build_artifacts/*.exe
+            dist/*.exe
