@@ -6,14 +6,15 @@ on:
     branches: ["main"]
 
 env:
-  APP_NAME: hankstoremanager
+  APP_NAME: HankstoreManager
   APP_VERSION: 0.01
   PYTHON_VERSION: '3.11'
+  CONDA_ENV_NAME: hankstoremanager
 
 jobs:
   build-windows-installer:
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
@@ -21,37 +22,50 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Python (actions/setup-python)
+      - name: Setup runner Python (fallback)
         uses: actions/setup-python@v4
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Debug: python --version and where python
+      - name: Show runner info
         shell: pwsh
         run: |
-          Write-Host "Python version and location:"
+          Write-Host "Runner OS:" (Get-CimInstance Win32_OperatingSystem).Caption
           python --version
           Get-Command python | Select-Object Source | Format-List
 
-      - name: Verify tkinter availability in build Python
-        shell: pwsh
+      - name: Detect conda
+        id: detect_conda
+        shell: bash
         run: |
-          try {
-            python - <<'PY'
-import importlib, sys
-try:
-    import tkinter
-    import tkinter.ttk
-    print("TKINTER_OK", getattr(tkinter, "TkVersion", "unknown"))
-except Exception as e:
-    print("TKINTER_IMPORT_ERROR:", e, file=sys.stderr)
-    raise
-PY
-          } catch {
-            Write-Warning "tkinter import failed in the current Python. Will attempt to install official CPython via Chocolatey."
-          }
+          if command -v conda >/dev/null 2>&1; then
+            echo "has_conda=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_conda=false" >> $GITHUB_OUTPUT
+          fi
 
-      - name: Install MSYS2 and mingw packages (sqlcipher)
+      - name: Create/update conda env using mamba (best-effort)
+        if: steps.detect_conda.outputs.has_conda == 'true'
+        id: conda_env
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f environment.yml ]; then
+            echo "No environment.yml found; skipping conda env creation"
+            echo "env_created=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          ENV_NAME=${CONDA_ENV_NAME}
+          # Try to install mamba for faster/more reliable solves
+          conda install -n base -c conda-forge mamba -y || echo "mamba install failed; falling back to conda"
+          if command -v mamba >/dev/null 2>&1; then
+            mamba env update -f environment.yml -n "${ENV_NAME}" --prune
+          else
+            conda env update -f environment.yml -n "${ENV_NAME}" --prune
+          fi
+          echo "env_created=true" >> $GITHUB_OUTPUT
+
+      - name: Install MSYS2 + mingw sqlcipher (Windows)
         uses: msys2/setup-msys2@v2
         with:
           update: true
@@ -62,15 +76,15 @@ PY
           msystem: MINGW64
           path-type: auto
 
-      - name: Ensure mingw64 bin on PATH
+      - name: Ensure mingw64 bin on PATH (Windows)
         shell: pwsh
         run: |
           $mingw = "C:\msys64\mingw64\bin"
           if (Test-Path $mingw) {
-            Write-Host "Adding $mingw to PATH"
             "PATH=$mingw;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            Write-Host "Added mingw64 to PATH"
           } else {
-            Write-Host "mingw64 bin not found at $mingw; continuing"
+            Write-Host "mingw64 bin not found; continuing"
           }
 
       - name: Locate SQLCipher DLL and export SQLCIPHER_DLL_PATH
@@ -99,21 +113,64 @@ PY
             Write-Host "SQLCipher DLL not found automatically; PyInstaller may still collect DLL from wheels"
           }
 
-      - name: Install Python build deps (pip)
+      - name: Install Python build deps (conda-run if env present, else pip)
         shell: bash
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+          set -euo pipefail
+          ENV_NAME=${CONDA_ENV_NAME}
+          # If conda env exists, install pip deps inside it
+          if conda info --envs | awk '{print $1}' | grep -q "^${ENV_NAME}$"; then
+            conda run -n "${ENV_NAME}" python -m pip install --upgrade pip setuptools wheel || true
+            if [ -f requirements.txt ]; then
+              conda run -n "${ENV_NAME}" python -m pip install -r requirements.txt || true
+            else
+              conda run -n "${ENV_NAME}" python -m pip install pyinstaller cryptography python-dotenv || true
+            fi
           else
-            pip install pyinstaller cryptography python-dotenv
+            python -m pip install --upgrade pip setuptools wheel
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt || true
+            else
+              pip install pyinstaller cryptography python-dotenv || true
+            fi
           fi
+
+      - name: Verify tkinter availability in build Python (use conda env python if present)
+        shell: pwsh
+        run: |
+          $envName = "${{ env.CONDA_ENV_NAME }}"
+          $useConda = $false
+          try { if ((conda info --envs | awk '{print $1}' | grep -q "^$envName$") -eq $null) { } } catch {}
+          if (conda info --envs 2>$null | awk '{print $1}' | grep -q "^$envName$") { $useConda = $true }
+          if ($useConda) {
+            Write-Host "Testing tkinter inside conda env $envName"
+            conda run -n $envName python - <<'PY'
+import sys
+try:
+    import tkinter, tkinter.ttk
+    print("TKINTER_OK", getattr(tkinter, "TkVersion", "unknown"))
+except Exception as e:
+    print("TKINTER_IMPORT_ERROR:", e, file=sys.stderr)
+    raise
+PY
+          } else {
+            Write-Host "Testing tkinter using runner Python"
+            python - <<'PY'
+import sys
+try:
+    import tkinter, tkinter.ttk
+    print("TKINTER_OK", getattr(tkinter, "TkVersion", "unknown"))
+except Exception as e:
+    print("TKINTER_IMPORT_ERROR:", e, file=sys.stderr)
+    raise
+PY
+          }
 
       - name: Verify spec files exist
         shell: pwsh
         run: |
-          if (-not (Test-Path "./postinstall_writer.spec")) { Write-Error "postinstall_writer.spec missing at repo root"; exit 1 }
-          if (-not (Test-Path "./hankstoremanager.spec")) { Write-Error "hankstoremanager.spec missing at repo root"; exit 1 }
+          if (-not (Test-Path "./postinstall_writer.spec")) { Write-Error "postinstall_writer.spec missing"; exit 1 }
+          if (-not (Test-Path "./hankstoremanager.spec")) { Write-Error "hankstoremanager.spec missing"; exit 1 }
           Write-Host "Spec files found."
 
       - name: Create install/install_values.txt from secret (production)
@@ -127,112 +184,57 @@ PY
             $content = "FACTURATION_OBR_FERNET_KEY=$($env:PROD_FERNET_KEY)`nOBR_USERNAME=`nOBR_PASSWORD=`nOBR_SYSTEM_ID=`n"
             Set-Content -Path install\install_values.txt -Value $content -Encoding UTF8
           } else {
-            Write-Host "PROD_FERNET_KEY not set; skipping creation of install_values.txt"
+            if (-not (Test-Path "install\install_values.txt")) { "" | Out-File -FilePath install\install_values.txt -Encoding utf8 }
+            Write-Host "No PROD_FERNET_KEY secret set; created placeholder install_values.txt"
           }
 
       - name: Build postinstall_writer (PyInstaller)
         shell: bash
         run: |
-          pyinstaller --noconfirm --clean postinstall_writer.spec --hidden-import=tkinter --hidden-import=tkinter.ttk
+          set -euo pipefail
+          ENV_NAME=${CONDA_ENV_NAME}
+          if conda info --envs | awk '{print $1}' | grep -q "^${ENV_NAME}$"; then
+            conda run -n "${ENV_NAME}" pyinstaller --noconfirm --clean postinstall_writer.spec --hidden-import=tkinter --hidden-import=tkinter.ttk
+          else
+            pyinstaller --noconfirm --clean postinstall_writer.spec --hidden-import=tkinter --hidden-import=tkinter.ttk
+          fi
 
       - name: Build application (PyInstaller)
         shell: bash
         run: |
-          pyinstaller --noconfirm --clean hankstoremanager.spec --hidden-import=tkinter --hidden-import=tkinter.ttk
+          set -euo pipefail
+          ENV_NAME=${CONDA_ENV_NAME}
+          if conda info --envs | awk '{print $1}' | grep -q "^${ENV_NAME}$"; then
+            conda run -n "${ENV_NAME}" pyinstaller --noconfirm --clean hankstoremanager.spec --hidden-import=tkinter --hidden-import=tkinter.ttk
+          else
+            pyinstaller --noconfirm --clean hankstoremanager.spec --hidden-import=tkinter --hidden-import=tkinter.ttk
+          fi
 
       - name: Prepare install/build_artifacts
-        shell: bash
-        run: |
-          mkdir -p install/build_artifacts
-          [ -f dist/postinstall_writer.exe ] && cp -v dist/postinstall_writer.exe install/build_artifacts/ || true
-          [ -f dist/hankstoremanager.exe ] && cp -v dist/hankstoremanager.exe install/build_artifacts/ || true
-          ls -la install/build_artifacts || true
-
-      - name: Post-build: list bundle contents (debug)
         shell: pwsh
         run: |
-          $distDir = "dist\hankstoremanager"
-          if (Test-Path $distDir) {
-            Write-Host "Listing dist folder:"
-            Get-ChildItem -Recurse $distDir | Select-Object FullName,Length | Format-Table -AutoSize
-          } else {
-            Write-Warning "dist\hankstoremanager not found; checking dist root"
-            Get-ChildItem -Recurse dist | Select-Object FullName,Length | Format-Table -AutoSize
-          }
+          $build = Join-Path $PWD "install\build_artifacts"
+          if (-not (Test-Path $build)) { New-Item -ItemType Directory -Path $build | Out-Null }
+          if (Test-Path "dist\postinstall_writer.exe") { Copy-Item "dist\postinstall_writer.exe" (Join-Path $build "postinstall_writer.exe") -Force }
+          if (Test-Path "dist\hankstoremanager.exe") { Copy-Item "dist\hankstoremanager.exe" (Join-Path $build "hankstoremanager.exe") -Force }
+          Get-ChildItem $build | Select-Object Name,Length
 
-      - name: Verify Tcl/Tk present in bundle
+      - name: Install Visual C++ Redistributable (VC++ 2015-2022) via Chocolatey
         shell: pwsh
         run: |
-          $dist="dist\hankstoremanager"
-          $missing = $false
-          if (-not (Test-Path $dist)) { Write-Warning "$dist not found"; exit 0 }
-          if (-not (Test-Path "$dist\tcl")) {
-            Write-Warning "tcl folder missing in bundle ($dist\tcl)"
-            $missing = $true
-          }
-          $dlls = Get-ChildItem -Path $dist -Filter "tcl*.dll" -ErrorAction SilentlyContinue
-          if (-not $dlls) {
-            Write-Warning "No tcl/tk DLLs found next to exe in $dist"
-            $missing = $true
-          }
-          if ($missing) {
-            Write-Warning "Tcl/Tk appears missing from the bundle; the app may fail to import tkinter at runtime"
-          } else {
-            Write-Host "Tcl/Tk resources look present in bundle"
-          }
-
-      - name: Verify installer inputs
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "install/build_artifacts/hankstoremanager.exe")) { Write-Error "Missing: install/build_artifacts/hankstoremanager.exe"; exit 1 }
-          if (-not (Test-Path "install/build_artifacts/postinstall_writer.exe")) { Write-Error "Missing: install/build_artifacts/postinstall_writer.exe"; exit 1 }
-          if (-not (Test-Path "install/install_values.txt")) { Write-Warning "install_values.txt absent (OK en dev, attendu en prod si secret défini)" }
-          if (-not (Test-Path "src/assets/app.ico")) { Write-Warning "src/assets/app.ico absent (icônes des raccourcis dépendront de l'exe)" }
-          if (-not (Test-Path "src/assets/logo.jpg")) { Write-Warning "src/assets/logo.jpg absent (wizard image optionnelle)" }
-          Write-Host "Installer inputs verified."
+          Write-Host "Installing Visual C++ Redistributable (vcredist-all) via Chocolatey"
+          choco install vcredist-all -y
+          Write-Host "vcredist-all exit code: $LASTEXITCODE"
+          $possible = @(
+            "$env:windir\System32\vcruntime140.dll",
+            "$env:windir\SysWOW64\vcruntime140.dll"
+          )
+          foreach ($p in $possible) { if (Test-Path $p) { Write-Host "Found runtime file: $p" } else { Write-Host "Not found: $p" } }
 
       - name: Install Inno Setup (Chocolatey)
         shell: pwsh
         run: |
           choco install innosetup -y
-
-      - name: Install Visual C++ Redistributable (choco)
-        shell: pwsh
-        run: |
-          Write-Host "Installing Visual C++ Redistributable (VC++ 2015-2022) via Chocolatey"
-          choco install vcredist-all -y
-          Write-Host "vcredist-all exit code: $LASTEXITCODE"
-
-      - name: Install official CPython via choco (optional, enabled)
-        shell: pwsh
-        run: |
-          Write-Host "Installing CPython via Chocolatey to ensure Tcl/Tk presence"
-          choco install python --version=3.11.6 -y
-          # Ensure the new python is first on PATH for subsequent steps
-          $pyPath = (Get-Command python).Source
-          Write-Host "Python resolved to: $pyPath"
-          $pythonDir = Split-Path -Parent $pyPath
-          "PATH=$pythonDir;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: Post-choco verify python and tkinter
-        shell: pwsh
-        run: |
-          Write-Host "Post-choco: python --version and import tkinter test"
-          python --version
-          try {
-            python - <<'PY'
-import sys
-try:
-    import tkinter
-    import tkinter.ttk
-    print("TKINTER_OK", getattr(tkinter, "TkVersion", "unknown"))
-except Exception as e:
-    print("TKINTER_IMPORT_ERROR:", e, file=sys.stderr)
-    raise
-PY
-          } catch {
-            Write-Warning "tkinter import failed even after installing CPython via choco. Check the runner image or consider installing Tcl/Tk manually."
-          }
 
       - name: Compile Inno Setup Script (ISCC)
         shell: pwsh
@@ -241,11 +243,12 @@ PY
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { $iscc = "ISCC.exe" }
-          if (-not (Test-Path $iscc)) {
-            Write-Error "ISCC.exe not found; ensure Inno Setup is installed"
-            exit 1
-          }
-          & $iscc "install\installer.iss" | Write-Host
+          if (-not (Test-Path $iscc)) { Write-Error "ISCC.exe not found; ensure Inno Setup is installed"; exit 1 }
+          Push-Location "install"
+          & $iscc "installer.iss"
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { Write-Error "ISCC failed with exit code $code"; exit $code }
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

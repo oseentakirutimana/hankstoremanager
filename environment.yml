@@ -13,6 +13,6 @@ dependencies:
   - pyinstaller
   - cryptography
   - python-dotenv
-  # Windows-only packages (msys2 utile pour libsqlcipher sur Windows)
   - msys2  # [win]
-  # Ajoute d'autres paquets Windows-only ici avec # [win] si nécessaire
+  - pip:
+    - -r requirements.txt
